@@ -35,7 +35,9 @@ data class UiState(
 class SessionViewModel(app: Application) : AndroidViewModel(app), SensorEventListener {
     private val sensorManager = app.getSystemService(SensorManager::class.java)
     private val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-    private val tts = TextToSpeech(app) { status -> if (status == TextToSpeech.SUCCESS) tts.language = Locale.JAPANESE }
+    private val tts: TextToSpeech = TextToSpeech(app) { status ->
+        if (status == TextToSpeech.SUCCESS) tts.language = Locale.JAPANESE
+    }
     private val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 60)
 
     private val _ui = MutableStateFlow(UiState())
