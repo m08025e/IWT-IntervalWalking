@@ -11,112 +11,195 @@ import android.speech.tts.TextToSpeech
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableStateFlow
+import com.example.iwt.sensor.ActivityRecognitionManager
+import com.example.iwt.sensor.CadenceEstimator
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import java.util.Locale
 import kotlin.math.abs
 
 data class UiState(
+    // Session state
     val fastPhase: Boolean = true,
+    val set: Int = 0,
+    val formHint: String = "",
+    val targetSpm: Int = 120,
+    val targetSpmRange: IntRange = 115..125,
+
+    // Common state
     val remainingSeconds: Int = 180,
     val cadenceSpm: Int = 0,
-    val formHint: String = "胸を張り 目線は水平",
     val paused: Boolean = false,
     val finished: Boolean = false,
-    val avgSpm: Int = 0,
-    val set: Int = 0
+    val avgSpm: Int = 0
 ) {
     val remainingMinutes: Int get() = remainingSeconds / 60
     val remainingSecondsPart: String get() = (remainingSeconds % 60).toString().padStart(2,'0')
 }
 
-class SessionViewModel(app: Application) : AndroidViewModel(app), SensorEventListener {
+class SessionViewModel(app: Application) : AndroidViewModel(app) {
     private val sensorManager = app.getSystemService(SensorManager::class.java)
-    private val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-    private val tts: TextToSpeech = TextToSpeech(app) { status ->
-        if (status == TextToSpeech.SUCCESS) tts.language = Locale.JAPANESE
-    }
+    private lateinit var tts: TextToSpeech
     private val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 60)
+    private lateinit var cadenceEstimator: CadenceEstimator
+    private lateinit var activityRecognitionManager: ActivityRecognitionManager
+
+
+    private var metronomeJob: Job? = null
+
+    init {
+        tts = TextToSpeech(app) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                tts.language = Locale.JAPANESE
+            }
+        }
+        cadenceEstimator = CadenceEstimator(sensorManager) { spm ->
+            _ui.value = _ui.value.copy(cadenceSpm = spm)
+        }
+        activityRecognitionManager = ActivityRecognitionManager(app) { isWalking ->
+            cadenceEstimator.setWalkingState(isWalking)
+        }
+    }
 
     private val _ui = MutableStateFlow(UiState())
     val uiState = _ui.asStateFlow()
 
     private var running = false
-    private var stepsInWindow = 0
-    private var lastPeakTime = 0L
-    private var lastZ = 0f
     private var sumSpm = 0
     private var samples = 0
 
-    fun start() {
+    private fun resetState() {
+        _ui.value = UiState()
+        sumSpm = 0
+        samples = 0
+        running = false
+    }
+
+    fun start(fastSpm: Int, slowSpm: Int) {
         if (running) return
+        resetState()
         running = true
-        sensorManager.registerListener(this, accel, SensorManager.SENSOR_DELAY_GAME)
-        speak("速歩を始めます")
-        startTimer()
+        cadenceEstimator.start()
+        activityRecognitionManager.start()
+        startTimer(fastSpm, slowSpm)
+        startMetronome()
     }
 
     fun togglePause() { _ui.value = _ui.value.copy(paused = !_ui.value.paused) }
 
     fun cancel() {
         running = false
-        sensorManager.unregisterListener(this)
-        try { tts.shutdown() } catch (_: Exception) {}
-        try { tone.release() } catch (_: Exception) {}
+        metronomeJob?.cancel()
+        cadenceEstimator.stop()
+        activityRecognitionManager.stop()
     }
 
-    private fun startTimer() {
+    private fun startMetronome() {
+        metronomeJob?.cancel()
+        metronomeJob = viewModelScope.launch(Dispatchers.Default) {
+            while (running) {
+                if (!uiState.value.paused && uiState.value.targetSpm > 0) {
+                    val delayMs = 60000L / uiState.value.targetSpm
+                    try {
+                        tone.startTone(ToneGenerator.TONE_CDMA_PIP, 150)
+                    } catch (_: Exception) {}
+                    delay(delayMs)
+                } else {
+                    delay(100) // Check again in 100ms if paused
+                }
+            }
+        }
+    }
+
+    private fun startTimer(fastSpm: Int, slowSpm: Int) {
         viewModelScope.launch(Dispatchers.Default) {
             var fast = true
             var remain = 180
             var totalSets = 0
+
+            // Initial phase setup
+            setPhase(fast, fastSpm, slowSpm)
+
             while (running) {
                 if (!_ui.value.paused) {
                     remain -= 1
                     if (remain <= 0) {
                         fast = !fast
                         remain = 180
-                        if (fast) { totalSets += 1; speak("次の速歩を始めます") }
-                        else { speak("スローに切り替えます") }
+                        if (fast) {
+                            totalSets += 1
+                        }
+                        setPhase(fast, fastSpm, slowSpm, totalSets)
                     }
-                    val spm = stepsInWindow * 2  // rough estimate; update every second
-                    sumSpm += spm; samples += 1
+
+                    // SPM calculation is now handled by CadenceEstimator, just need to update avg
+                    sumSpm += uiState.value.cadenceSpm
+                    samples += 1
+
                     _ui.value = _ui.value.copy(
-                        fastPhase = fast,
                         remainingSeconds = remain,
-                        cadenceSpm = spm,
-                        formHint = if (fast) "胸を張り 肘を後ろへ引く" else "呼吸を整え 歩幅を小さく",
                         set = totalSets
                     )
-                    if (remain == 10) beep()
+                    if (remain == 10) {
+                        val nextPhaseIsFast = !fast
+                        if (nextPhaseIsFast) {
+                            speak("まもなく速歩に切り替わります")
+                        } else {
+                            speak("まもなくスローに切り替わります")
+                        }
+                    }
                 }
-                stepsInWindow = 0
                 delay(1000)
-                if (totalSets >= 5 && fast && remain == 180) {
+                if (totalSets >= 5) {
                     running = false
-                    val avg = if (samples>0) sumSpm / samples else 0
+                    val avg = if (samples > 0) sumSpm / samples else 0
                     _ui.value = _ui.value.copy(finished = true, avgSpm = avg)
+                    speak("お疲れ様でした。")
                     cancel()
                 }
             }
         }
     }
 
+    private fun setPhase(fast: Boolean, fastSpm: Int, slowSpm: Int, sets: Int = 0) {
+        val target: Int
+        val announcement: String
+
+        if (fast) {
+            target = fastSpm
+            announcement = if (sets > 0) "次の速歩を始めます" else "速歩を始めます"
+        } else {
+            target = slowSpm
+            announcement = "スローに切り替えます"
+        }
+
+        _ui.value = _ui.value.copy(
+            fastPhase = fast,
+            targetSpm = target,
+            targetSpmRange = target-5..target+5,
+            formHint = ""
+        )
+        speak(announcement)
+    }
+
     private fun speak(text: String) { try { tts.speak(text, TextToSpeech.QUEUE_ADD, null, "iwt") } catch (_: Exception) {} }
     private fun beep() { try { tone.startTone(ToneGenerator.TONE_PROP_BEEP, 200) } catch (_: Exception) {} }
 
-    override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type != Sensor.TYPE_ACCELEROMETER) return
-        val z = event.values[2]
-        val dz = z - lastZ
-        val now = System.currentTimeMillis()
-        if (kotlin.math.abs(dz) > 2.0 && now - lastPeakTime > 300) {
-            stepsInWindow += 1
-            lastPeakTime = now
+    override fun onCleared() {
+        super.onCleared()
+        metronomeJob?.cancel()
+        cadenceEstimator.stop()
+        activityRecognitionManager.stop()
+        try {
+            tts.shutdown()
+        } catch (_: Exception) {
         }
-        lastZ = z
+        try {
+            tone.release()
+        } catch (_: Exception) {
+        }
     }
-    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {}
 }
